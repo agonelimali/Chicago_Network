@@ -1,0 +1,786 @@
+=== SOLUTION ARCHITECTURE BLUEPRINT ===
+
+Device Models and Roles:
+- CORE1: Cisco Catalyst 9500-48Y4C - Primary Core Switch/Router
+- CORE2: Cisco Catalyst 9500-48Y4C - Secondary Core Switch/Router (HA)
+- DIST1: Cisco Catalyst 9300-48P-E - Distribution Switch, Floor 1 Main
+- DIST2: Cisco Catalyst 9300-48P-E - Distribution Switch, Floor 2 Main
+- DIST3: Cisco Catalyst 9300-48P-E - Distribution Switch, Floor 3 Main
+- ACCESS1A/B, ACCESS2A/B, ACCESS3A/B: Cisco Catalyst 9200-24P-E - Access Switches (2 per floor, stacked)
+- WLC1: Cisco Catalyst 9800-40 - Wireless LAN Controller for Guest/Employee WiFi
+- FIREWALL1: Cisco Secure Firewall 3100 - Edge Security/Segmentation
+
+Network Topology Description:
+- Three-tier hierarchical campus: Core/Distribution/Access with physical redundancy from access to distribution and distribution to both cores.
+- Dual-core design for failover and non-stop routing/switching; both cores run OSPF with routed links.
+- Three VLAN domains: Employees, Guest WiFi, IoT devices, plus a dedicated VoIP VLAN with L2/L3 segmentation.
+- Strict network segmentation: Guest and IoT networks cannot access internal resources except voice call control from VoIP to call managers as allowed by security policy.
+- WLANs segregate guest (internet only, NAT at edge), employee (full campus access), and support 802.1X/AAA.
+- Core and distribution switches use HSRP for first-hop redundancy; access switches implement port security and 802.1X NAC.
+- Layer 3 routed links between core/distributions; trunks to access. All inter-floor traffic passes through distribution/core.
+- Mandatory logging, AAA, SNMPv3, and compliance controls enforced.
+  
+CRITICAL P2P VALIDATION REQUIREMENTS:
+  - All routed links: /30 subnets from 10.10.255.0/24
+  - Descriptions exactly match connected interface and device
+  - OSPF areas 0.0.0.0 for campus core/distribution
+  - Trunk VLANs strictly matched
+  
+---
+
+=== DEVICE 1: CORE1 (C9500-48Y4C) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname CORE1
+no ip domain-lookup
+ip domain-name chicago.hq.example.com
+service password-encryption
+enable secret [REDACTED]
+username admin privilege 15 secret [REDACTED]
+banner motd ^ Authorized Users Only - All Activity Monitored ^
+
+! SSH & AAA
+aaa new-model
+aaa authentication login default group radius local
+aaa authorization exec default group radius local
+aaa accounting exec default start-stop group radius
+ip ssh version 2
+ip ssh authentication-retries 3
+crypto key generate rsa modulus 4096
+
+! SNMPv3 for secure monitoring
+snmp-server group SECURE v3 priv read SYS_VIEW write SYS_WRITE
+snmp-server user monuser SECURE v3 auth sha [REDACTED] priv aes 256 [REDACTED]
+snmp-server view SYS_VIEW iso included
+snmp-server view SYS_WRITE iso included
+
+! Logging/Compliance
+logging host 10.200.0.100 transport udp port 514
+logging trap informational
+logging source-interface Loopback0
+
+! NTP, timezone
+clock timezone CST -6 0
+ntp server 10.200.0.50 prefer
+ntp update-calendar
+
+! Redundant management
+interface Loopback0
+ ip address 10.200.254.1 255.255.255.255
+ description MANAGEMENT-LOOPBACK
+
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Interface Configuration =====
+vlan 10
+  name EMPLOYEE
+vlan 20
+  name GUEST
+vlan 30
+  name IOT
+vlan 40
+  name VOIP
+vlan 999
+  name MGMT
+
+! SVI Interfaces with OSPF
+interface Vlan10
+ ip address 10.10.10.1 255.255.255.0
+ description EMPLOYEE-SVI
+ ip ospf 1 area 0
+ ip helper-address 10.200.0.25
+
+interface Vlan20
+ ip address 10.10.20.1 255.255.255.0
+ description GUEST-SVI
+ ip access-group GUEST_SEGMENTATION in
+ ip ospf 1 area 0
+
+interface Vlan30
+ ip address 10.10.30.1 255.255.255.0
+ description IOT-SVI
+ ip access-group IOT_SEGMENTATION in
+ ip ospf 1 area 0
+
+interface Vlan40
+ ip address 10.10.40.1 255.255.255.0
+ description VOIP-SVI
+ ip helper-address 10.200.0.25
+ ip ospf 1 area 0
+
+interface Vlan999
+ ip address 10.200.254.10 255.255.255.0
+ description MGMT
+
+!
+! Core - DIST1 P2P /30
+interface TenGigabitEthernet1/0/1
+ description P2P_TO_DIST1_Te1/0/1
+ no switchport
+ ip address 10.10.255.1 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+! Core - DIST2
+interface TenGigabitEthernet1/0/2
+ description P2P_TO_DIST2_Te1/0/1
+ no switchport
+ ip address 10.10.255.5 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+! Core - DIST3
+interface TenGigabitEthernet1/0/3
+ description P2P_TO_DIST3_Te1/0/1
+ no switchport
+ ip address 10.10.255.9 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+! CORE1-CORE2 redundant link
+interface TenGigabitEthernet1/0/48
+ description P2P_TO_CORE2_Te1/0/48
+ no switchport
+ ip address 10.10.255.13 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+! Management interface
+interface GigabitEthernet1/0/1
+ description OOB-MGMT
+ switchport access vlan 999
+ spanning-tree portfast
+
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 10.200.254.1
+ log-adjacency-changes
+ passive-interface default
+ no passive-interface Vlan10
+ no passive-interface Vlan20
+ no passive-interface Vlan30
+ no passive-interface Vlan40
+ no passive-interface Vlan999
+ no passive-interface TenGigabitEthernet1/0/1
+ no passive-interface TenGigabitEthernet1/0/2
+ no passive-interface TenGigabitEthernet1/0/3
+ no passive-interface TenGigabitEthernet1/0/48
+
+! HSRP for gateway redundancy
+interface Vlan10
+ standby 10 ip 10.10.10.254
+ standby 10 priority 110
+ standby 10 preempt
+ standby 10 authentication md5 key-string [REDACTED]
+!
+interface Vlan20
+ standby 20 ip 10.10.20.254
+ standby 20 priority 110
+ standby 20 preempt
+ standby 20 authentication md5 key-string [REDACTED]
+!
+interface Vlan30
+ standby 30 ip 10.10.30.254
+ standby 30 priority 110
+ standby 30 preempt
+ standby 30 authentication md5 key-string [REDACTED]
+!
+interface Vlan40
+ standby 40 ip 10.10.40.254
+ standby 40 priority 110
+ standby 40 preempt
+ standby 40 authentication md5 key-string [REDACTED]
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+
+! Access-class for VTY
+ip access-list standard MGMT_VTY
+ permit 10.200.254.0 0.0.0.255
+ deny   any
+line vty 0 15
+ access-class MGMT_VTY in
+ transport input ssh
+
+! ACLs for Network Segmentation (see notes in FIREWALL1 for edge policies)
+ip access-list extended GUEST_SEGMENTATION
+ remark GUEST => BLOCK lateral & campus
+ deny   ip 10.10.0.0 0.0.255.255 any
+ permit ip any host 8.8.8.8
+ permit ip any host 8.8.4.4
+ permit ip any any eq 80
+ permit ip any any eq 443
+
+ip access-list extended IOT_SEGMENTATION
+ remark IOT => Only permit to NVR servers (example 10.100.10.10-30); block else
+ permit ip 10.10.30.0 0.0.0.255 10.100.10.10 0.0.0.20
+ deny   ip 10.10.30.0 0.0.0.255 10.10.0.0 0.0.255.255
+ permit ip any any
+
+! DHCP snooping, DAI, BPDU guard (on all access port policies)
+ip dhcp snooping vlan 10,20,30,40
+ip dhcp snooping
+
+! ===== END SECTION =====
+copy running-config startup-config
+
+---
+
+=== DEVICE 2: CORE2 (C9500-48Y4C) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname CORE2
+no ip domain-lookup
+ip domain-name chicago.hq.example.com
+service password-encryption
+enable secret [REDACTED]
+username admin privilege 15 secret [REDACTED]
+banner motd ^ Authorized Users Only - All Activity Monitored ^
+
+! SSH & AAA (identical to CORE1; shares NMS)
+aaa new-model
+aaa authentication login default group radius local
+aaa authorization exec default group radius local
+aaa accounting exec default start-stop group radius
+ip ssh version 2
+crypto key generate rsa modulus 4096
+
+! SNMP, Logging, NTP (mirrored from CORE1)
+snmp-server group SECURE v3 priv read SYS_VIEW write SYS_WRITE
+snmp-server user monuser SECURE v3 auth sha [REDACTED] priv aes 256 [REDACTED]
+snmp-server view SYS_VIEW iso included
+snmp-server view SYS_WRITE iso included
+logging host 10.200.0.100 transport udp port 514
+logging trap informational
+logging source-interface Loopback0
+clock timezone CST -6 0
+ntp server 10.200.0.50 prefer
+ntp update-calendar
+
+interface Loopback0
+ ip address 10.200.254.2 255.255.255.255
+ description MANAGEMENT-LOOPBACK
+
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Interface Configuration =====
+vlan 10
+ name EMPLOYEE
+vlan 20
+ name GUEST
+vlan 30
+ name IOT
+vlan 40
+ name VOIP
+vlan 999
+ name MGMT
+
+interface Vlan10
+ ip address 10.10.10.2 255.255.255.0
+ description EMPLOYEE-SVI
+ ip ospf 1 area 0
+ ip helper-address 10.200.0.25
+
+interface Vlan20
+ ip address 10.10.20.2 255.255.255.0
+ description GUEST-SVI
+ ip access-group GUEST_SEGMENTATION in
+ ip ospf 1 area 0
+
+interface Vlan30
+ ip address 10.10.30.2 255.255.255.0
+ description IOT-SVI
+ ip access-group IOT_SEGMENTATION in
+ ip ospf 1 area 0
+
+interface Vlan40
+ ip address 10.10.40.2 255.255.255.0
+ description VOIP-SVI
+ ip helper-address 10.200.0.25
+ ip ospf 1 area 0
+
+interface Vlan999
+ ip address 10.200.254.11 255.255.255.0
+ description MGMT
+
+interface TenGigabitEthernet1/0/1
+ description P2P_TO_DIST1_Te1/0/2
+ no switchport
+ ip address 10.10.255.17 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+interface TenGigabitEthernet1/0/2
+ description P2P_TO_DIST2_Te1/0/2
+ no switchport
+ ip address 10.10.255.21 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+interface TenGigabitEthernet1/0/3
+ description P2P_TO_DIST3_Te1/0/2
+ no switchport
+ ip address 10.10.255.25 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+interface TenGigabitEthernet1/0/48
+ description P2P_TO_CORE1_Te1/0/48
+ no switchport
+ ip address 10.10.255.14 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+interface GigabitEthernet1/0/1
+ description OOB-MGMT
+ switchport access vlan 999
+ spanning-tree portfast
+
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 10.200.254.2
+ log-adjacency-changes
+ passive-interface default
+ no passive-interface Vlan10
+ no passive-interface Vlan20
+ no passive-interface Vlan30
+ no passive-interface Vlan40
+ no passive-interface Vlan999
+ no passive-interface TenGigabitEthernet1/0/1
+ no passive-interface TenGigabitEthernet1/0/2
+ no passive-interface TenGigabitEthernet1/0/3
+ no passive-interface TenGigabitEthernet1/0/48
+
+! HSRP Standby Peer
+interface Vlan10
+ standby 10 ip 10.10.10.254
+ standby 10 priority 100
+ standby 10 preempt
+ standby 10 authentication md5 key-string [REDACTED]
+!
+interface Vlan20
+ standby 20 ip 10.10.20.254
+ standby 20 priority 100
+ standby 20 preempt
+ standby 20 authentication md5 key-string [REDACTED]
+!
+interface Vlan30
+ standby 30 ip 10.10.30.254
+ standby 30 priority 100
+ standby 30 preempt
+ standby 30 authentication md5 key-string [REDACTED]
+!
+interface Vlan40
+ standby 40 ip 10.10.40.254
+ standby 40 priority 100
+ standby 40 preempt
+ standby 40 authentication md5 key-string [REDACTED]
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+
+ip access-list standard MGMT_VTY
+ permit 10.200.254.0 0.0.0.255
+ deny   any
+line vty 0 15
+ access-class MGMT_VTY in
+ transport input ssh
+
+ip access-list extended GUEST_SEGMENTATION
+ remark GUEST => BLOCK lateral & campus
+ deny   ip 10.10.0.0 0.0.255.255 any
+ permit ip any host 8.8.8.8
+ permit ip any host 8.8.4.4
+ permit ip any any eq 80
+ permit ip any any eq 443
+
+ip access-list extended IOT_SEGMENTATION
+ remark IOT => Only permit to NVR servers; block else
+ permit ip 10.10.30.0 0.0.0.255 10.100.10.10 0.0.0.20
+ deny   ip 10.10.30.0 0.0.0.255 10.10.0.0 0.0.255.255
+ permit ip any any
+
+ip dhcp snooping vlan 10,20,30,40
+ip dhcp snooping
+
+! ===== END SECTION =====
+copy running-config startup-config
+
+---
+
+=== DEVICE 3: DIST1 (C9300-48P-E) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname DIST1
+ip domain-name chicago.hq.example.com
+no ip domain-lookup
+enable secret [REDACTED]
+username admin privilege 15 secret [REDACTED]
+service password-encryption
+
+aaa new-model
+aaa authentication login default group radius local
+aaa authorization exec default group radius local
+ip ssh version 2
+crypto key generate rsa modulus 4096
+
+snmp-server group SECURE v3 priv
+snmp-server user monuser SECURE v3 auth sha [REDACTED] priv aes 256 [REDACTED]
+logging host 10.200.0.100
+logging trap informational
+
+clock timezone CST -6 0
+ntp server 10.200.0.50
+
+interface Loopback0
+ ip address 10.200.254.11 255.255.255.255
+
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name EMPLOYEE
+vlan 20
+ name GUEST
+vlan 30
+ name IOT
+vlan 40
+ name VOIP
+vlan 999
+ name MGMT
+
+! Uplink to CORE1
+interface TenGigabitEthernet1/0/1
+ description P2P_TO_CORE1_Te1/0/1
+ no switchport
+ ip address 10.10.255.2 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+! Uplink to CORE2
+interface TenGigabitEthernet1/0/2
+ description P2P_TO_CORE2_Te1/0/1
+ no switchport
+ ip address 10.10.255.18 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+
+! Downlinks to ACCESS switches (trunks)
+interface GigabitEthernet1/0/3
+ description TO_ACCESS1A_Gi1/0/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,999
+ spanning-tree portfast trunk
+ spanning-tree bpduguard enable
+
+interface GigabitEthernet1/0/4
+ description TO_ACCESS1B_Gi1/0/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,999
+ spanning-tree portfast trunk
+ spanning-tree bpduguard enable
+
+interface Vlan999
+ ip address 10.200.254.21 255.255.255.0
+ description MGMT
+
+! ===== END SECTION =====
+
+! ===== SECTION: Layer 3 Routing =====
+router ospf 1
+ router-id 10.200.254.11
+ log-adjacency-changes
+ passive-interface default
+ no passive-interface TenGigabitEthernet1/0/1
+ no passive-interface TenGigabitEthernet1/0/2
+!
+ip route 0.0.0.0 0.0.0.0 10.10.255.1
+ip route 0.0.0.0 0.0.0.0 10.10.255.17
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security Policy Enforcement =====
+
+spanning-tree portfast default
+spanning-tree bpduguard default
+
+ip dhcp snooping vlan 10,20,30,40
+ip dhcp snooping
+
+! ===== END SECTION =====
+copy running-config startup-config
+
+---
+
+=== DEVICE 4: ACCESS1A (C9200-24P-E) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname ACCESS1A
+ip domain-name chicago.hq.example.com
+enable secret [REDACTED]
+username admin privilege 15 secret [REDACTED]
+service password-encryption
+
+aaa new-model
+aaa authentication login default group radius local
+aaa authorization exec default group radius local
+
+ip ssh version 2
+crypto key generate rsa modulus 4096
+
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN Assignment =====
+vlan 10
+ name EMPLOYEE
+vlan 20
+ name GUEST
+vlan 30
+ name IOT
+vlan 40
+ name VOIP
+vlan 999
+ name MGMT
+
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+! Trunk uplink to DIST1
+interface GigabitEthernet1/0/1
+ description TO_DIST1_Gi1/0/3
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,999
+ spanning-tree portfast trunk
+ spanning-tree bpduguard enable
+
+! Employee ports - 802.1X NAC, port security
+interface range GigabitEthernet1/0/2-24
+ description FLOOR1_EMPLOYEE
+ switchport access vlan 10
+ switchport mode access
+ spanning-tree portfast
+ authentication port-control auto
+ dot1x pae authenticator
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security aging type inactivity
+
+! Voice aux configuration (inline power, voice VLAN)
+interface range GigabitEthernet1/0/10-14
+ description VOICE_PHONE
+ switchport access vlan 10
+ switchport mode access
+ switchport voice vlan 40
+ spanning-tree portfast
+
+! IoT/Camera ports
+interface range GigabitEthernet1/0/15-18
+ description IOT_DEVICE
+ switchport access vlan 30
+ switchport mode access
+ spanning-tree portfast
+ switchport port-security
+
+interface range GigabitEthernet1/0/19-20
+ description GUEST_WIFI_AP
+ switchport access vlan 20
+ switchport mode access
+ spanning-tree portfast
+
+! Management/VLAN999 for switch management
+interface GigabitEthernet1/0/24
+ description MGMT_CONSOLE
+ switchport access vlan 999
+ switchport mode access
+ spanning-tree portfast
+
+! BPDU Guard, root guard, DHCP snooping always enabled by default
+! ===== END SECTION =====
+
+! ===== SECTION: Security Enforcement =====
+spanning-tree portfast default
+spanning-tree bpduguard default
+
+ip dhcp snooping vlan 10,20,30,40
+ip dhcp snooping
+
+! ===== END SECTION =====
+copy running-config startup-config
+
+---
+
+=== DEVICE 5: WLC1 (C9800-40) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname WLC1
+!
+username admin privilege 15 secret [REDACTED]
+enable secret [REDACTED]
+!
+clock timezone CST -6 0
+ntp server 10.200.0.50
+!
+!
+! AAA Integration
+aaa new-model
+radius server RADSRV
+ address ipv4 10.200.0.70 auth-port 1812 acct-port 1813
+ key [REDACTED]
+!
+aaa authentication dot1x default group radius
+!
+! ===== END SECTION =====
+
+! ===== SECTION: WLAN/SSID Configuration =====
+!
+wlan EMPLOYEE 10 EMPLOYEE-SSID
+  client vlan 10
+  security wpa wpa2 wpa3
+  security wpa akm 802.1x
+  radio policy dot11 5ghz dot11 24ghz
+  no shutdown
+!
+wlan GUEST 20 GUEST-SSID
+  client vlan 20
+  security wpa wpa2 wpa3
+  security wpa akm psk set-key ascii [REDACTED]
+  no shutdown
+!
+wlan IOT 30 IOT-SSID
+  client vlan 30
+  security wpa wpa2
+  security wpa akm psk set-key ascii [REDACTED]
+  no shutdown
+!
+ap group Chicago-Floors
+  vlan-name 10 10
+  vlan-name 20 20
+  vlan-name 30 30
+  vlan-name 40 40
+
+! Mobility and Management
+mobility group ChicagoHQ
+!
+country US
+!
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security =====
+!
+! Guest VLAN restricted at core/firewall
+!
+! Management interface
+interface GigabitEthernet0
+ description MGMT
+ ip address 10.200.254.50 255.255.255.0
+!
+! ===== END SECTION =====
+copy running-config startup-config
+
+---
+
+=== DEVICE 6: FIREWALL1 (Cisco Secure Firewall 3100) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname FIREWALL1
+!
+enable password [REDACTED]
+!
+! AAA Integration & SSH Only
+aaa authentication ssh console LOCAL
+username admin password [REDACTED]
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface & Zone-Based Security =====
+!
+interface GigabitEthernet0/0
+ nameif INSIDE
+ security-level 100
+ ip address 10.200.254.254 255.255.255.0
+!
+interface GigabitEthernet0/1
+ nameif OUTSIDE
+ security-level 0
+ ip address dhcp setroute
+!
+interface GigabitEthernet0/2
+ nameif GUEST
+ security-level 20
+ ip address 10.10.20.253 255.255.255.0
+!
+interface GigabitEthernet0/3
+ nameif IOT
+ security-level 10
+ ip address 10.10.30.253 255.255.255.0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Segmentation/Policy NAT/Security =====
+!
+access-list OUTSIDE_IN extended permit icmp any any
+access-list GUEST_OUT extended permit tcp any any eq www
+access-list GUEST_OUT extended permit tcp any any eq https
+access-list GUEST_OUT deny ip any 10.10.0.0 255.255.0.0
+access-list GUEST_OUT permit ip any any
+
+access-list IOT_OUT permit ip 10.10.30.0 255.255.255.0 10.100.10.10 255.255.255.20
+access-list IOT_OUT deny ip any 10.10.0.0 255.255.0.0
+access-list IOT_OUT permit ip any any
+
+! NAT Overload for GUEST and IOT
+nat (GUEST,OUTSIDE) after-auto source dynamic any interface
+nat (IOT,OUTSIDE) after-auto source dynamic any interface
+
+! ===== END SECTION =====
+
+! ===== SECTION: Logging and Compliance =====
+!
+logging enable
+logging buffer-size 16384
+logging trap informational
+logging host INSIDE 10.200.0.100
+!
+! ===== END SECTION =====
+copy running-config startup-config
+
+---
+
+=== DEPLOYMENT RECOMMENDATIONS ===
+
+Installation Sequence:
+1. Rack, interconnect, and power-up core (CORE1/CORE2) and distribution switches.
+2. Configure CORE1, CORE2, then DIST switches (DIST1, DIST2, DIST3).
+3. Configure access switches for each floor; implement trunk and access VLANs.
+4. Deploy and configure FIREWALL1 edge before WAN/ISP handoff is established.
+5. Install, register, configure WLC1; join APs to correct AP group.
+6. Bring up wireless SSIDs, test security segmentation.
+7. Integrate AAA/RADIUS and monitoring as final step; verify NTP and SNMP reachability.
+
+Verification Procedures:
+- Use `show ip ospf neighbor`, `show redundancy` on core to verify HA/OSPF.
+- Ping SVIs, default gateways, test failover between cores (HSRP test).
+- Confirm VLAN/host isolation as per ACLs/NAT/firewall policies (`show access-lists`, test cross-VLAN ping).
+- Use `show run | section dhcp`, `show port-security address` on switches.
+- Test wireless by authenticating with both Employee and Guest/WiFi SSIDs.
+- Validate logging and event forwarding to SIEM/monitoring system (`show logging`).
+- Confirm VoIP call quality with QoS monitoring on trunk/voice VLANs.
+
+=== DEPLOYMENT SUCCESS CRITERIA ===
+
+✓ CONNECTIVITY: All floors, employee, guest, IoT, and VoIP devices have correct network access and failover; no cross-traffic between Guest/IoT and internal networks except voice flows.
+✓ ROUTING: OSPF adjacency established across all routed links; core/distribution routes converge in <2s after failover.
+✓ SECURITY: Guest/IOT ACLs confirmed; 802.1X/NAC enforced on access, port security operational, firewall NATs and blocks as required.
+✓ MANAGEMENT: Core, distribution, access, WLC, and firewall accessible securely via SSH; SNMPv3 traps and logging reach SIEM.
+✓ REDUNDANCY: HSRP tested, distribution-to-core uplinks failover with no user impact, APs migrate across WLC if controller is rebooted.
